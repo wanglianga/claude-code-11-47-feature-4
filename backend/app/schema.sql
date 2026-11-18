@@ -10,9 +10,7 @@
 
 CREATE TABLE IF NOT EXISTS source_documents (
     doc_id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    dataset_type        TEXT NOT NULL CHECK (dataset_type IN
-                        ('population','road_node','road_edge','shelter',
-                         'road_event','boundary')),
+    dataset_type        TEXT NOT NULL,
     title               TEXT NOT NULL,
     source_org          TEXT,
     unit_note           TEXT,                     -- 原文计量单位说明
@@ -22,8 +20,40 @@ CREATE TABLE IF NOT EXISTS source_documents (
     revision_no         INTEGER NOT NULL DEFAULT 1,
     supersedes_doc_id   BIGINT REFERENCES source_documents(doc_id),
     raw_text            TEXT,                     -- 原文摘录
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_dataset_type CHECK (dataset_type IN
+        ('population','road_node','road_edge','shelter',
+         'road_event','boundary',
+         'mobile_signal','venue_presence','transfer_registration','overlap_rule'))
 );
+
+-- 旧库（无命名约束）幂等迁移：把 dataset_type 上的旧 CHECK 替换为含临时来源类型的新约束
+DO $$
+DECLARE
+    con_name TEXT;
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint
+               WHERE conrelid = 'source_documents'::regclass AND contype = 'c'
+                 AND conname <> 'chk_dataset_type') THEN
+        FOREACH con_name IN ARRAY (
+            SELECT array_agg(conname) FROM pg_constraint
+            WHERE conrelid = 'source_documents'::regclass AND contype = 'c'
+              AND conname <> 'chk_dataset_type'
+        )
+        LOOP
+            EXECUTE format('ALTER TABLE source_documents DROP CONSTRAINT %I', con_name);
+        END LOOP;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conrelid = 'source_documents'::regclass
+                     AND conname = 'chk_dataset_type') THEN
+        ALTER TABLE source_documents
+            ADD CONSTRAINT chk_dataset_type CHECK (dataset_type IN
+            ('population','road_node','road_edge','shelter',
+             'road_event','boundary',
+             'mobile_signal','venue_presence','transfer_registration','overlap_rule'));
+    END IF;
+END $$;
 
 -- ---------------------------------------------------------------- 区域边界 --
 CREATE TABLE IF NOT EXISTS region_boundaries (
@@ -301,4 +331,224 @@ CREATE TABLE IF NOT EXISTS publications (
     evidence_cutoff_at  TIMESTAMPTZ NOT NULL,
     created_by          TEXT NOT NULL DEFAULT 'analyst',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================================
+-- 临时暴露人口区间（网格 × 时段）
+-- 模块边界（以输入快照关联，模块间不共享可变状态）：
+--   冻结人口基线(pop_grids/pop_grid_revisions)
+--     → 临时信号接入(mobile_signal_*/venue_*/transfer_registrations)
+--     → 覆盖率/重叠校准(exposure_input_snapshots + exposure_overlap_rules)
+--     → 区间计算(exposure_estimates / exposure_grid_periods)
+--     → 情景发布(publications 引用估计版本号)
+-- 纪律：隐私阈值、覆盖率或来源数据修订只生成新估计版本；旧版本结果行不原地
+--       改写，旧预案保留当时分母。无法证明互斥/包含的来源绝不相加。
+-- ============================================================================
+
+-- ------------------------------------------------- 移动信号：分层采样与校准 --
+-- 每行是某运营商在某网格、某时段、某人群分层上的去重采样观测；
+-- suppressed=TRUE 表示因隐私小样本抑制，sample_count 不可见（按缺失处理，不得记零）。
+CREATE TABLE IF NOT EXISTS mobile_signal_samples (
+    sample_id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    operator_id         TEXT NOT NULL,
+    grid_id             TEXT NOT NULL REFERENCES pop_grids(grid_id),
+    stratum             TEXT NOT NULL,               -- 分层（resident/visitor…）
+    window_start        TIMESTAMPTZ NOT NULL,
+    window_end          TIMESTAMPTZ NOT NULL,
+    sample_count        DOUBLE PRECISION,            -- 抑制时为 NULL
+    suppressed          BOOLEAN NOT NULL DEFAULT FALSE,
+    operator_coverage   DOUBLE PRECISION NOT NULL,   -- 该网格时段运营商人群占比（覆盖率）
+    coverage_stable     BOOLEAN NOT NULL DEFAULT TRUE,  -- 覆盖率是否稳定（核验结论）
+    field_verified      BOOLEAN NOT NULL DEFAULT FALSE, -- 是否经现场核验
+    source_doc_id       BIGINT REFERENCES source_documents(doc_id),
+    received_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (window_end > window_start),
+    CHECK (operator_coverage > 0 AND operator_coverage <= 1),
+    CHECK (suppressed OR sample_count IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS idx_mss_grid_window
+    ON mobile_signal_samples(grid_id, window_start, window_end);
+
+-- 分层校准系数：系数把“采样人数”扩展为该分层在场人数；系数与误差仅对
+-- 覆盖率稳定且现场核验的分层生效，其余分层不得做比例外推。
+CREATE TABLE IF NOT EXISTS mobile_signal_calibration (
+    calibration_id      BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    operator_id         TEXT NOT NULL,
+    grid_id             TEXT NOT NULL REFERENCES pop_grids(grid_id),
+    stratum             TEXT NOT NULL,
+    effective_from      TIMESTAMPTZ NOT NULL,
+    effective_to        TIMESTAMPTZ,
+    calibration_factor  DOUBLE PRECISION NOT NULL CHECK (calibration_factor > 0),
+    sampling_rel_error  DOUBLE PRECISION NOT NULL CHECK   -- 相对抽样误差（如 0.10=±10%）
+                        (sampling_rel_error >= 0 AND sampling_rel_error < 1),
+    coverage_basis      DOUBLE PRECISION NOT NULL,         -- 系数所依据的覆盖率
+    field_verified      BOOLEAN NOT NULL DEFAULT FALSE,
+    source_doc_id       BIGINT REFERENCES source_documents(doc_id),
+    UNIQUE (operator_id, grid_id, stratum, effective_from)
+);
+
+-- --------------------------------------------- 场所（景区/寄宿学校）在场记录 --
+-- 已核实的在场/签到人数；privacy_suppressed=TRUE 时 verified_count 不可见。
+-- presence_kind：scenic（景区流入）/ boarding_school（寄宿学校在校）。
+CREATE TABLE IF NOT EXISTS venue_presence_records (
+    presence_id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    venue_id            TEXT NOT NULL,
+    venue_name          TEXT NOT NULL,
+    presence_kind       TEXT NOT NULL CHECK (presence_kind IN
+                        ('scenic','boarding_school')),
+    grid_id             TEXT NOT NULL REFERENCES pop_grids(grid_id),
+    window_start        TIMESTAMPTZ NOT NULL,
+    window_end          TIMESTAMPTZ NOT NULL,
+    verified_count      DOUBLE PRECISION,            -- 已核实在场（签到/点名），抑制时 NULL
+    privacy_suppressed  BOOLEAN NOT NULL DEFAULT FALSE,
+    source_doc_id       BIGINT REFERENCES source_documents(doc_id),
+    received_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (window_end > window_start),
+    CHECK (privacy_suppressed OR verified_count IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS idx_vpr_grid_window
+    ON venue_presence_records(grid_id, window_start, window_end);
+
+-- 场所容量上限：保守方案中作为上界约束（容量未必满员，不能当作确定在场）。
+CREATE TABLE IF NOT EXISTS venue_capacity (
+    capacity_id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    venue_id            TEXT NOT NULL,
+    grid_id             TEXT NOT NULL REFERENCES pop_grids(grid_id),
+    capacity_persons    DOUBLE PRECISION NOT NULL CHECK (capacity_persons >= 0),
+    capacity_kind       TEXT NOT NULL DEFAULT 'hard' CHECK (capacity_kind IN ('hard','soft')),
+    effective_from      TIMESTAMPTZ NOT NULL,
+    effective_to        TIMESTAMPTZ,
+    source_doc_id       BIGINT REFERENCES source_documents(doc_id),
+    UNIQUE (venue_id, effective_from)
+);
+
+-- ----------------------------------------------------------- 转移登记（减量） --
+-- 网格内因临时转移而离开的登记人数；late_arrival=TRUE 表示晚到登记，
+-- 晚到登记只进入新估计版本，旧版本结果保留。
+CREATE TABLE IF NOT EXISTS transfer_registrations (
+    transfer_id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    grid_id             TEXT NOT NULL REFERENCES pop_grids(grid_id),
+    window_start        TIMESTAMPTZ NOT NULL,
+    window_end          TIMESTAMPTZ NOT NULL,
+    registered_persons  DOUBLE PRECISION NOT NULL CHECK (registered_persons >= 0),
+    destination_grid_id TEXT REFERENCES pop_grids(grid_id),  -- 去向（可空=区外/未知）
+    late_arrival        BOOLEAN NOT NULL DEFAULT FALSE,
+    source_doc_id       BIGINT REFERENCES source_documents(doc_id),
+    received_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (window_end > window_start)
+);
+CREATE INDEX IF NOT EXISTS idx_tr_grid_window
+    ON transfer_registrations(grid_id, window_start, window_end);
+
+-- --------------------------------------------- 可证明的跨来源人员重叠关系 ----
+-- 仅登记“可证明”的互斥/包含关系（现场核验或制度依据）；没有规则的来源组合
+-- 在区间计算中按不可识别处理：保留并集包络，绝不直接相加。
+-- relation：disjoint（互斥，可相加）/ subset_of（A 的人包含于 B）/ overlap_known
+-- （已知至少/至多重叠人数，写入 min_overlap_persons/max_overlap_persons）。
+CREATE TABLE IF NOT EXISTS exposure_overlap_rules (
+    rule_id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    grid_id             TEXT NOT NULL REFERENCES pop_grids(grid_id),
+    source_a            TEXT NOT NULL,               -- mobile / scenic / boarding_school / transfer
+    source_b            TEXT NOT NULL,
+    relation            TEXT NOT NULL CHECK (relation IN
+                        ('disjoint','subset_of','overlap_known')),
+    direction           TEXT NOT NULL DEFAULT 'a_in_b'
+                        CHECK (direction IN ('a_in_b','b_in_a','none')),
+    min_overlap_persons DOUBLE PRECISION NOT NULL DEFAULT 0,
+    max_overlap_persons DOUBLE PRECISION,            -- NULL 表示仅给出下界
+    evidence_note       TEXT NOT NULL,
+    source_doc_id       BIGINT REFERENCES source_documents(doc_id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (source_a <> source_b),
+    CHECK (min_overlap_persons >= 0),
+    CHECK (max_overlap_persons IS NULL OR max_overlap_persons >= min_overlap_persons)
+);
+
+-- ------------------------------------------------- 临时暴露估计输入快照 -------
+-- 一次估计的不可变输入清单：时间窗、证据截止、隐私阈值、采用的来源行与规则行。
+-- 快照之后到达的修订（晚到登记/覆盖率修订）不修改本快照，只用于产生新版本。
+CREATE TABLE IF NOT EXISTS exposure_input_snapshots (
+    snapshot_id         UUID PRIMARY KEY,
+    window_start        TIMESTAMPTZ NOT NULL,
+    window_end          TIMESTAMPTZ NOT NULL,
+    evidence_cutoff_at  TIMESTAMPTZ NOT NULL,
+    privacy_threshold   INTEGER NOT NULL CHECK (privacy_threshold >= 0),
+    boundary_id         TEXT REFERENCES region_boundaries(boundary_id),
+    source_row_fingerprint TEXT NOT NULL,            -- 采用来源行集合指纹
+    included_mobile_ids     JSONB NOT NULL,
+    included_venue_ids      JSONB NOT NULL,
+    included_transfer_ids   JSONB NOT NULL,
+    included_rule_ids       JSONB NOT NULL,
+    calibration_ids         JSONB NOT NULL,
+    created_by          TEXT NOT NULL DEFAULT 'analyst',
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (window_end > window_start)
+);
+
+-- ----------------------------------------------------------- 估计版本（头表） --
+CREATE TABLE IF NOT EXISTS exposure_estimates (
+    estimate_id         UUID PRIMARY KEY,
+    estimate_version    INTEGER NOT NULL,            -- 同输入参数的版本号，修订只增版本
+    snapshot_id         UUID NOT NULL REFERENCES exposure_input_snapshots(snapshot_id),
+    window_start        TIMESTAMPTZ NOT NULL,
+    window_end          TIMESTAMPTZ NOT NULL,
+    evidence_cutoff_at  TIMESTAMPTZ NOT NULL,
+    privacy_threshold   INTEGER NOT NULL,
+    boundary_id         TEXT REFERENCES region_boundaries(boundary_id),
+    baseline_pop_as_of  DATE NOT NULL,               -- 固定的常住人口基准日
+    method_note         TEXT NOT NULL,               -- 校准方案/保守方案的适用说明
+    supersedes_estimate_id UUID REFERENCES exposure_estimates(estimate_id),
+    created_by          TEXT NOT NULL DEFAULT 'analyst',
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ee_window_version
+    ON exposure_estimates (window_start, window_end, evidence_cutoff_at,
+                           estimate_version, COALESCE(boundary_id, ''));
+CREATE INDEX IF NOT EXISTS idx_ee_window ON exposure_estimates(window_start, window_end);
+
+-- --------------------------------------------- 网格 × 时段区间结果 -------------
+-- 净变化 delta = 临时增加 - 临时减少（分别保留区间，不互相吞掉）。
+-- 恒等关系：upper-lower = point_unknown + interval_unknown。
+-- 叠加后可达需求 = 常住人口基线 + delta 区间。
+CREATE TABLE IF NOT EXISTS exposure_grid_periods (
+    period_id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    estimate_id         UUID NOT NULL REFERENCES exposure_estimates(estimate_id),
+    grid_id             TEXT NOT NULL REFERENCES pop_grids(grid_id),
+    window_start        TIMESTAMPTZ NOT NULL,
+    window_end          TIMESTAMPTZ NOT NULL,
+    baseline_population DOUBLE PRECISION NOT NULL,   -- 冻结基线（固定分母）
+    increase_lower      DOUBLE PRECISION NOT NULL,   -- 临时增加下界
+    increase_upper      DOUBLE PRECISION,            -- 临时增加上界；NULL=覆盖缺口导致不可估计
+    decrease_lower      DOUBLE PRECISION NOT NULL,   -- 临时减少下界
+    decrease_upper      DOUBLE PRECISION NOT NULL,   -- 临时减少上界（转移登记为确定值）
+    delta_lower         DOUBLE PRECISION NOT NULL,   -- 净变化下界
+    delta_upper         DOUBLE PRECISION,            -- 净变化上界；NULL=不可估计
+    point_unknown       DOUBLE PRECISION NOT NULL,   -- 抑制/无观测导致的点状未知（受抑制来源条数）
+    interval_unknown    DOUBLE PRECISION,            -- 结构性未知宽度；NULL=上界不可估计，无法数值化
+    sampling_margin     DOUBLE PRECISION NOT NULL DEFAULT 0, -- 抽样误差半宽（人）
+    method_mode         TEXT NOT NULL CHECK (method_mode IN
+                        ('calibrated','conservative','mixed')),
+    reachable_baseline  DOUBLE PRECISION,            -- 基线可达人口（来自覆盖任务，可空）
+    demand_lower        DOUBLE PRECISION,            -- 基线叠加后可达需求下界
+    demand_upper        DOUBLE PRECISION,            -- 基线叠加后可达需求上界
+    computed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (estimate_id, grid_id)
+);
+CREATE INDEX IF NOT EXISTS idx_egp_estimate ON exposure_grid_periods(estimate_id);
+
+-- --------------------------------------------- 区间采用证据（逐来源留痕） ------
+CREATE TABLE IF NOT EXISTS exposure_evidence_items (
+    evidence_id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    estimate_id         UUID NOT NULL REFERENCES exposure_estimates(estimate_id),
+    grid_id             TEXT NOT NULL,
+    source_kind         TEXT NOT NULL,               -- mobile/scenic/boarding_school/transfer/overlap
+    source_ref          TEXT NOT NULL,               -- 来源行标识（sample_id/presence_id…）
+    observed_count      DOUBLE PRECISION,            -- 原始观测（抑制时 NULL）
+    adopted_lower       DOUBLE PRECISION NOT NULL,
+    adopted_upper       DOUBLE PRECISION,            -- NULL=该来源上界不可估计
+    suppressed          BOOLEAN NOT NULL DEFAULT FALSE,
+    coverage_value      DOUBLE PRECISION,
+    calibrated          BOOLEAN NOT NULL DEFAULT FALSE,
+    note                TEXT NOT NULL,
+    UNIQUE (estimate_id, grid_id, source_kind, source_ref)
 );

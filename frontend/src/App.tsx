@@ -4,6 +4,7 @@ import ComparisonView from "./ComparisonView";
 import SourcesView from "./SourcesView";
 import CacheView from "./CacheView";
 import PublicationsView from "./PublicationsView";
+import ExposureView from "./ExposureView";
 
 export type Toast = { kind: "info" | "error"; text: string; key: number };
 
@@ -23,6 +24,7 @@ export default function App() {
 
   const tabs = [
     ["scenario", "情景分析"],
+    ["exposure", "临时暴露人口"],
     ["comparison", "情景对比"],
     ["sources", "来源目录"],
     ["cache", "缓存与任务"],
@@ -48,6 +50,7 @@ export default function App() {
       </nav>
       <main>
         {tab === "scenario" && <ScenarioView pushToast={pushToast} />}
+        {tab === "exposure" && <ExposureView pushToast={pushToast} />}
         {tab === "comparison" && <ComparisonView pushToast={pushToast} />}
         {tab === "sources" && <SourcesView />}
         {tab === "cache" && <CacheView pushToast={pushToast} />}

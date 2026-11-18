@@ -4,6 +4,10 @@ import type {
   Comparison,
   ConnectorRow,
   EdgeRevision,
+  ExposureEstimateDetail,
+  ExposureEstimateListItem,
+  ExposureEstimatePayload,
+  ExposureSources,
   GridRow,
   NodeRow,
   OpenWindow,
@@ -116,7 +120,7 @@ export const api = {
       body: JSON.stringify({ task_a_id: taskA, task_b_id: taskB }),
     }),
 
-  publish: (taskA: string, taskB: string, title: string) =>
+  publish: (taskA: string, taskB: string, title: string, exposureEstimateId?: string | null) =>
     request<{
       publication: { publication_id: string; [k: string]: unknown };
       comparison: Comparison;
@@ -128,6 +132,7 @@ export const api = {
         task_b_id: taskB,
         title,
         created_by: "analyst-ui",
+        exposure_estimate_id: exposureEstimateId ?? null,
       }),
     }),
 
@@ -186,4 +191,51 @@ export const api = {
   reseed: () => request("/admin/reseed", { method: "POST" }),
 
   applyC2: () => request("/admin/apply-c2-revision", { method: "POST" }),
+
+  // ------------------------------------------------ 临时暴露人口区间 --------
+  exposureSources: () => request<ExposureSources>("/exposure/sources"),
+
+  createExposureEstimate: (payload: ExposureEstimatePayload) =>
+    request<ExposureEstimateDetail>("/exposure/estimates", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  listExposureEstimates: () =>
+    request<{ estimates: ExposureEstimateListItem[] }>("/exposure/estimates"),
+
+  exposureEstimate: (estimateId: string) =>
+    request<ExposureEstimateDetail>(`/exposure/estimates/${estimateId}`),
+
+  exposureGridDrilldown: (estimateId: string, gridId: string) =>
+    request<{
+      period: import("./types").ExposurePeriod;
+      evidence: import("./types").ExposureEvidence[];
+    }>(
+      `/exposure/estimates/${estimateId}/grid/${encodeURIComponent(gridId)}`
+    ),
+
+  registerMobile: (payload: Record<string, unknown>) =>
+    request<{ sample_id: number; doc_id: number }>("/exposure/mobile-signals", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  registerVenue: (payload: Record<string, unknown>) =>
+    request<{ presence_id: number; doc_id: number }>("/exposure/venue-presence", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  registerTransfer: (payload: Record<string, unknown>) =>
+    request<{ transfer_id: number; doc_id: number; late_arrival: boolean }>(
+      "/exposure/transfers",
+      { method: "POST", body: JSON.stringify(payload) }
+    ),
+
+  registerOverlapRule: (payload: Record<string, unknown>) =>
+    request<{ rule_id: number; doc_id: number }>("/exposure/overlap-rules", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 };

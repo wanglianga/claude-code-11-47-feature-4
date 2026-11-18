@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "./api";
-import type { Comparison, ScenarioListRow } from "./types";
+import type { Comparison, ExposureEstimateListItem, ScenarioListRow } from "./types";
 
 export default function ComparisonView({
   pushToast,
@@ -12,12 +12,15 @@ export default function ComparisonView({
   const [taskB, setTaskB] = useState("");
   const [comp, setComp] = useState<Comparison | null>(null);
   const [title, setTitle] = useState("暴雨批次比较");
+  const [estimates, setEstimates] = useState<ExposureEstimateListItem[]>([]);
+  const [estimateId, setEstimateId] = useState("");
 
   const refresh = () =>
     api.listScenarios().then((r) => setScenarios(r.scenarios));
 
   useEffect(() => {
     refresh().catch((e) => pushToast(String(e), "error"));
+    api.listExposureEstimates().then((r) => setEstimates(r.estimates)).catch(() => undefined);
   }, []);
 
   const run = async () => {
@@ -34,7 +37,7 @@ export default function ComparisonView({
 
   const publish = async () => {
     try {
-      const out = await api.publish(taskA, taskB, title);
+      const out = await api.publish(taskA, taskB, title, estimateId || null);
       pushToast(`已发布 ${out.publication.publication_id}，完整输入清单已落库`);
     } catch (e) {
       pushToast(String(e), "error");
@@ -76,9 +79,21 @@ export default function ComparisonView({
             value={title}
             onChange={(e) => setTitle(e.target.value)}
           />
+          <select value={estimateId} onChange={(e) => setEstimateId(e.target.value)}>
+            <option value="">不关联临时暴露版本</option>
+            {estimates.map((e) => (
+              <option key={e.estimate_id} value={e.estimate_id}>
+                关联 v{e.estimate_version} 区间（{e.window_start.slice(11, 16)}–
+                {e.window_end.slice(11, 16)}，{e.grid_count}格）
+              </option>
+            ))}
+          </select>
           <button className="btn secondary" onClick={publish} disabled={!comp}>
             发布并固化完整输入清单
           </button>
+        </div>
+        <div className="small muted" style={{ marginTop: 6 }}>
+          关联临时暴露估计后，其输入快照指纹与区间汇总会一并固化到发布清单，旧预案保留当时分母。
         </div>
       </div>
 

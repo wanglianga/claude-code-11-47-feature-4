@@ -1,10 +1,14 @@
 """开发期冒烟脚本：核对小型样例的手工复算预期（非正式测试）。"""
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta, timezone
 
 from app.db import get_conn, init_db
-from app.seed import T0, C1, C2, apply_c2_revision
+from app.seed import (
+    T0, C1, C2, apply_c2_revision,
+    W1_START, W1_END, EX_CUTOFF_1, EX_CUTOFF_2,
+)
 from app.services.compute import manager
 from app.services.comparison import build_comparison
+from app.services.exposure import build_exposure_estimate
 from app.services.snapshot import get_or_create_network_version, load_snapshot
 from app.engine import solve
 
@@ -81,6 +85,31 @@ def main():
         cur.execute("SELECT version_id, cutoff_at, edge_fingerprint, event_fingerprint FROM road_network_versions ORDER BY version_id")
         for r in cur.fetchall():
             print(" version:", r)
+
+    # ---- 临时暴露人口区间（六类验收情形）----
+    print("\n=== 临时暴露人口区间 ===")
+    v1 = build_exposure_estimate(
+        conn, window_start=W1_START, window_end=W1_END, evidence_cutoff=EX_CUTOFF_1,
+        privacy_threshold=10, baseline_as_of=as_of, reachable_task_id=tb,
+    )
+    print("E1 totals:", v1["totals"])
+    for gid in ("G1", "G2", "G3", "G4", "G6", "G8"):
+        p = next(x for x in v1["periods"] if x["grid_id"] == gid)
+        print(" ", gid, "increase=[%s,%s] decrease=%s delta=[%s,%s] pointUnknown=%s mode=%s"
+              % (p["increase_lower"], p["increase_upper"], p["decrease_lower"],
+                 p["delta_lower"], p["delta_upper"], p["point_unknown"], p["method_mode"]))
+    # 晚到转移登记 → 新版本，旧版本保留
+    v2 = build_exposure_estimate(
+        conn, window_start=W1_START, window_end=W1_END, evidence_cutoff=EX_CUTOFF_2,
+        privacy_threshold=10, baseline_as_of=as_of, reachable_task_id=tb,
+    )
+    g8_v1 = next(x for x in v1["periods"] if x["grid_id"] == "G8")
+    g8_v2 = next(x for x in v2["periods"] if x["grid_id"] == "G8")
+    print("late transfer: G8 decrease v1=%s -> v2=%s; old version kept=%s"
+          % (g8_v1["decrease_lower"], g8_v2["decrease_lower"],
+             v1["estimate"]["estimate_version"] == 1))
+    print("G8 overlay demand (non-negative lower):",
+          g8_v2["demand_lower"], g8_v2["demand_upper"])
     conn.close()
 
 

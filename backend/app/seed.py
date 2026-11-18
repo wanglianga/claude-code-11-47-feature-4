@@ -56,6 +56,10 @@ def reseed(conn) -> None:
         cur.execute(
             """
             TRUNCATE TABLE
+                exposure_evidence_items, exposure_grid_periods, exposure_estimates,
+                exposure_input_snapshots, exposure_overlap_rules, transfer_registrations,
+                venue_capacity, venue_presence_records, mobile_signal_calibration,
+                mobile_signal_samples,
                 grid_share_results, node_arrivals, coverage_summaries,
                 coverage_cache_index, compute_task_viewers, task_edge_dependencies,
                 compute_tasks, publications, scenarios, grid_connectors,
@@ -70,6 +74,7 @@ def reseed(conn) -> None:
     _seed_documents_and_network(conn)
     _seed_shelters(conn)
     _seed_population(conn)
+    seed_exposure(conn)
     conn.commit()
 
 
@@ -262,6 +267,237 @@ def _seed_population(conn) -> None:
                VALUES (%s,%s,%s,1,%s)""",
             [(g, n, r, conn_doc) for g, n, r in connectors],
         )
+
+
+# ============================================================================
+# 临时暴露人口样例（网格 × 时段），覆盖六类验收情形
+# 分析窗口 W1 = [T0+60min, T0+120min)（暴雨当日 09:00–10:00 UTC）
+# 证据截止 E1 = T0+55min（首轮），E2 = T0+115min（晚到登记后再估计）
+# ============================================================================
+W1_START = T0 + timedelta(minutes=60)
+W1_END = T0 + timedelta(minutes=120)
+EX_CUTOFF_1 = T0 + timedelta(minutes=55)
+EX_CUTOFF_2 = T0 + timedelta(minutes=115)
+PRIVACY_THRESHOLD = 10
+
+
+def seed_exposure(conn) -> None:
+    """写入临时暴露人口六类验收样例（幂等；调用前应已 TRUNCATE 临时来源表）。"""
+    with conn.cursor() as cur:
+        _seed_mobile_and_calibration(cur)
+        _seed_venues(cur)
+        _seed_transfers(cur)
+        _seed_overlap_rules(cur)
+        conn.commit()
+
+
+def _seed_mobile_and_calibration(cur) -> None:
+    # 运营商 OP1 覆盖率 0.50、稳定且现场核验；OP2 覆盖率 0.30、不稳定（覆盖下降）
+    doc_op1 = _add_doc(
+        cur, "mobile_signal", "OP1 移动信号分时采样（覆盖率稳定·已核验）",
+        "单位：人（去重设备）；覆盖率=运营商人群占比",
+        W1_START, EX_CUTOFF_1,
+        raw="OP1 在各网格覆盖率 0.50，经现场核验稳定；分层 visitor 给出采样人数",
+        org="运营商信令合作方 OP1",
+    )
+    doc_op2 = _add_doc(
+        cur, "mobile_signal", "OP2 移动信号分时采样（暴雨期覆盖下降）",
+        "单位：人（去重设备）；覆盖率=运营商人群占比",
+        W1_START, EX_CUTOFF_1,
+        raw="OP2 暴雨期基站退服，覆盖率由 0.40 降至 0.30 且波动，未通过稳定性核验",
+        org="运营商信令合作方 OP2",
+    )
+
+    # 校准系数：仅 OP1、覆盖率 0.50、现场核验；系数 2.0、相对抽样误差 10%
+    cal_doc = _add_doc(
+        cur, "mobile_signal", "移动信号分层校准系数（现场核验版）",
+        "系数=1/有效覆盖率；抽样误差：相对值",
+        W1_START, EX_CUTOFF_1,
+        raw="visitor 分层校准因子 2.0（基于 0.50 稳定覆盖率），抽样相对误差 ±10%",
+        org="市应急管理局核验组",
+    )
+
+    def mobile(operator, grid, stratum, sample, suppressed, coverage, stable,
+               verified, doc, window_start=W1_START, window_end=W1_END):
+        cur.execute(
+            """INSERT INTO mobile_signal_samples
+                   (operator_id, grid_id, stratum, window_start, window_end, sample_count,
+                    suppressed, operator_coverage, coverage_stable, field_verified,
+                    source_doc_id, received_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (operator, grid, stratum, window_start, window_end,
+             None if suppressed else sample, suppressed, coverage, stable, verified,
+             doc, EX_CUTOFF_1 - timedelta(minutes=5)),
+        )
+
+    # 情形①节假日景区流入：G1 景区网格，OP1 采样 200 人 → 校准 400±40
+    mobile("OP1", "G1", "visitor", 200, False, 0.50, True, True, doc_op1)
+
+    # 情形②寄宿学校放假：G2 学校网格 OP1 采样在校 40 人（平时 300），校准 80±8
+    mobile("OP1", "G2", "visitor", 40, False, 0.50, True, True, doc_op1)
+
+    # 情形④移动信号覆盖下降：G8 OP2 覆盖率降到 0.30 且不稳，采样 60 人仅作下界
+    mobile("OP2", "G8", "visitor", 60, False, 0.30, False, False, doc_op2)
+
+    # 情形⑤隐私小样本抑制：G6 OP1 样本 6 人 < 阈值 10，平台抑制不可见
+    mobile("OP1", "G6", "visitor", None, True, 0.50, True, True, doc_op1)
+
+    # 校准系数行（OP1 / 各网格 / visitor 分层，覆盖率基准 0.50）
+    for grid in ("G1", "G2", "G6"):
+        cur.execute(
+            """INSERT INTO mobile_signal_calibration
+                   (operator_id, grid_id, stratum, effective_from, effective_to,
+                    calibration_factor, sampling_rel_error, coverage_basis,
+                    field_verified, source_doc_id)
+               VALUES (%s,%s,'visitor',%s,NULL,2.0,0.10,0.50,TRUE,%s)""",
+            ("OP1", grid, W1_START, cal_doc),
+        )
+
+
+def _seed_venues(cur) -> None:
+    scenic_doc = _add_doc(
+        cur, "venue_presence", "节假日景区客流签到与容量台账", "单位：人",
+        W1_START, EX_CUTOFF_1,
+        raw="G1 云湖景区闸机签到 350 人，核定最大承载 1200 人；G3 郊野营地签到 100 人/容量 300；"
+            "G6 小景点签到样本过小被抑制，容量 200",
+        org="文旅局景区管理处",
+    )
+    school_doc = _add_doc(
+        cur, "venue_presence", "寄宿学校在校点名与宿舍容量", "单位：人",
+        W1_START, EX_CUTOFF_1,
+        raw="G2 南门寄宿学校暴雨当日放假，留校点名 60 人，宿舍容量 500；"
+            "G3 研学营地宿舍点名 40 人，容量 100（与景区客流重叠关系无法识别）",
+        org="教育局校安科",
+    )
+
+    # 情形①景区流入：G1 已核实签到 350（下界），容量 1200（上界）
+    cur.execute(
+        """INSERT INTO venue_presence_records
+               (venue_id, venue_name, presence_kind, grid_id, window_start, window_end,
+                verified_count, privacy_suppressed, source_doc_id, received_at)
+           VALUES ('V-SCENIC-G1','云湖景区','scenic','G1',%s,%s,350,FALSE,%s,%s)""",
+        (W1_START, W1_END, scenic_doc, EX_CUTOFF_1 - timedelta(minutes=5)),
+    )
+    cur.execute(
+        """INSERT INTO venue_capacity
+               (venue_id, grid_id, capacity_persons, capacity_kind, effective_from, source_doc_id)
+           VALUES ('V-SCENIC-G1','G1',1200,'hard',%s,%s)""",
+        (W1_START, scenic_doc),
+    )
+
+    # 情形②寄宿学校放假：G2 留校 60（下界），宿舍容量 500（上界）
+    cur.execute(
+        """INSERT INTO venue_presence_records
+               (venue_id, venue_name, presence_kind, grid_id, window_start, window_end,
+                verified_count, privacy_suppressed, source_doc_id, received_at)
+           VALUES ('V-SCHOOL-G2','南门寄宿学校','boarding_school','G2',%s,%s,60,FALSE,%s,%s)""",
+        (W1_START, W1_END, school_doc, EX_CUTOFF_1 - timedelta(minutes=5)),
+    )
+    cur.execute(
+        """INSERT INTO venue_capacity
+               (venue_id, grid_id, capacity_persons, capacity_kind, effective_from, source_doc_id)
+           VALUES ('V-SCHOOL-G2','G2',500,'hard',%s,%s)""",
+        (W1_START, school_doc),
+    )
+
+    # 情形③跨来源重复观测（无规则组合）：G3 同时有景区与寄宿场所两笔在场记录，
+    # 两批人是否重叠无法识别 → 取并集包络（下界取大、上界取和），绝不直接相加下界
+    cur.execute(
+        """INSERT INTO venue_presence_records
+               (venue_id, venue_name, presence_kind, grid_id, window_start, window_end,
+                verified_count, privacy_suppressed, source_doc_id, received_at)
+           VALUES ('V-SCENIC-G3','郊野营地','scenic','G3',%s,%s,100,FALSE,%s,%s)""",
+        (W1_START, W1_END, scenic_doc, EX_CUTOFF_1 - timedelta(minutes=5)),
+    )
+    cur.execute(
+        """INSERT INTO venue_capacity
+               (venue_id, grid_id, capacity_persons, capacity_kind, effective_from, source_doc_id)
+           VALUES ('V-SCENIC-G3','G3',300,'hard',%s,%s)""",
+        (W1_START, scenic_doc),
+    )
+    cur.execute(
+        """INSERT INTO venue_presence_records
+               (venue_id, venue_name, presence_kind, grid_id, window_start, window_end,
+                verified_count, privacy_suppressed, source_doc_id, received_at)
+           VALUES ('V-SCHOOL-G3','研学营地宿舍','boarding_school','G3',%s,%s,40,FALSE,%s,%s)""",
+        (W1_START, W1_END, school_doc, EX_CUTOFF_1 - timedelta(minutes=5)),
+    )
+    cur.execute(
+        """INSERT INTO venue_capacity
+               (venue_id, grid_id, capacity_persons, capacity_kind, effective_from, source_doc_id)
+           VALUES ('V-SCHOOL-G3','G3',100,'hard',%s,%s)""",
+        (W1_START, school_doc),
+    )
+
+    # 情形⑤隐私小样本抑制：G6 景区签到仅 6 人，按隐私阈值抑制，但容量 200 仍约束上界
+    cur.execute(
+        """INSERT INTO venue_presence_records
+               (venue_id, venue_name, presence_kind, grid_id, window_start, window_end,
+                verified_count, privacy_suppressed, source_doc_id, received_at)
+           VALUES ('V-SCENIC-G6','滨河小景点','scenic','G6',%s,%s,NULL,TRUE,%s,%s)""",
+        (W1_START, W1_END, scenic_doc, EX_CUTOFF_1 - timedelta(minutes=5)),
+    )
+    cur.execute(
+        """INSERT INTO venue_capacity
+               (venue_id, grid_id, capacity_persons, capacity_kind, effective_from, source_doc_id)
+           VALUES ('V-SCENIC-G6','G6',200,'hard',%s,%s)""",
+        (W1_START, scenic_doc),
+    )
+
+
+def _seed_transfers(cur) -> None:
+    doc = _add_doc(
+        cur, "transfer_registration", "暴雨临时转移安置登记台账", "单位：人",
+        W1_START, EX_CUTOFF_1,
+        raw="G4 转移 120 人至安置点；G8 首批转移 80 人；G8 第二批 50 人晚到登记",
+        org="街道转移安置工作组",
+    )
+    # 减少侧：G4 确定减少 120；G8 首批 80（首轮可见）
+    for grid, persons, late, received in (
+        ("G4", 120, False, EX_CUTOFF_1 - timedelta(minutes=5)),
+        ("G8", 80, False, EX_CUTOFF_1 - timedelta(minutes=5)),
+    ):
+        cur.execute(
+            """INSERT INTO transfer_registrations
+                   (grid_id, window_start, window_end, registered_persons,
+                    destination_grid_id, late_arrival, source_doc_id, received_at)
+               VALUES (%s,%s,%s,%s,NULL,%s,%s,%s)""",
+            (grid, W1_START, W1_END, persons, late, doc, received),
+        )
+    # 情形⑥转移登记晚到：G8 第二批 50 人在 E1 之后、E2 之前到达
+    cur.execute(
+        """INSERT INTO transfer_registrations
+               (grid_id, window_start, window_end, registered_persons,
+                destination_grid_id, late_arrival, source_doc_id, received_at)
+           VALUES ('G8',%s,%s,50,NULL,TRUE,%s,%s)""",
+        (W1_START, W1_END, doc, EX_CUTOFF_1 + timedelta(minutes=30)),
+    )
+
+
+def _seed_overlap_rules(cur) -> None:
+    doc = _add_doc(
+        cur, "overlap_rule", "跨来源人员重叠关系现场核验单", "单位：人",
+        W1_START, EX_CUTOFF_1,
+        raw="G1 景区签到人群与移动信号 visitor 分层为同一批客流（闸机实名与信令比对）；"
+            "G2 留校学生与移动信号采样为包含关系；其余网格跨来源重叠无法识别，不得相加",
+        org="现场核验组",
+    )
+    # 情形③：G1 移动信号与景区签到已知重叠至少 300、至多 400 人
+    cur.execute(
+        """INSERT INTO exposure_overlap_rules
+               (grid_id, source_a, source_b, relation, direction,
+                min_overlap_persons, max_overlap_persons, evidence_note, source_doc_id)
+           VALUES ('G1','mobile','scenic','overlap_known','none',300,400,%s,%s)""",
+        ("实名闸机与信令比对：重叠客流介于 300–400 人", doc),
+    )
+    # G2：寄宿学校点名人群包含移动信号采样（学生均持手机且被 OP1 覆盖）
+    cur.execute(
+        """INSERT INTO exposure_overlap_rules
+               (grid_id, source_a, source_b, relation, direction,
+                min_overlap_persons, max_overlap_persons, evidence_note, source_doc_id)
+           VALUES ('G2','mobile','boarding_school','subset_of','a_in_b',0,NULL,%s,%s)""",
+        ("留校点名 60 人包含移动信号可见的学生样本", doc),
+    )
 
 
 # ----------------------------------------------------------- 较大样例 --

@@ -242,3 +242,103 @@ export interface Comparison {
   warnings: string[];
   basis_checks: Record<string, boolean>;
 }
+
+// ------------------------------------------------ 临时暴露人口区间 -----------
+export interface ExposureEstimatePayload {
+  window_start: string;
+  window_end: string;
+  evidence_cutoff: string;
+  privacy_threshold: number;
+  boundary_id?: string | null;
+  baseline_pop_as_of: string;
+  created_by: string;
+  reachable_task_id?: string | null;
+}
+
+export type ExposureMethodMode = "calibrated" | "conservative" | "mixed";
+
+export interface ExposurePeriod {
+  period_id: number;
+  estimate_id: string;
+  grid_id: string;
+  window_start: string;
+  window_end: string;
+  baseline_population: number;
+  increase_lower: number;
+  increase_upper: number | null;
+  decrease_lower: number;
+  decrease_upper: number;
+  delta_lower: number;
+  delta_upper: number | null;
+  point_unknown: number;
+  interval_unknown: number | null;
+  sampling_margin: number;
+  method_mode: ExposureMethodMode;
+  reachable_baseline: number | null;
+  demand_lower: number | null;
+  demand_upper: number | null;
+}
+
+export interface ExposureEvidence {
+  evidence_id: number;
+  grid_id: string;
+  source_kind: string;
+  source_ref: string;
+  observed_count: number | null;
+  adopted_lower: number;
+  adopted_upper: number | null;
+  suppressed: boolean;
+  coverage_value: number | null;
+  calibrated: boolean;
+  note: string;
+}
+
+export interface ExposureEstimateHeader {
+  estimate_id: string;
+  estimate_version: number;
+  snapshot_id: string;
+  window_start: string;
+  window_end: string;
+  evidence_cutoff_at: string;
+  privacy_threshold: number;
+  boundary_id: string | null;
+  baseline_pop_as_of: string;
+  method_note: string;
+  supersedes_estimate_id: string | null;
+  created_by: string;
+  created_at: string;
+}
+
+export interface ExposureTotals {
+  baseline_total: number;
+  increase_lower_total: number;
+  increase_upper_total: number | null;
+  decrease_lower_total: number;
+  decrease_upper_total: number;
+  delta_lower_total: number;
+  delta_upper_total: number | null;
+  point_unknown_sources: number;
+  open_upper_grid_count: number;
+  grid_count: number;
+}
+
+export interface ExposureEstimateDetail {
+  estimate: ExposureEstimateHeader;
+  snapshot: Record<string, unknown>;
+  periods: ExposurePeriod[];
+  evidence: ExposureEvidence[];
+  totals: ExposureTotals;
+}
+
+export interface ExposureEstimateListItem extends ExposureEstimateHeader {
+  grid_count: number;
+}
+
+export interface ExposureSources {
+  mobile_signals: Array<Record<string, unknown>>;
+  venue_presence: Array<Record<string, unknown>>;
+  venue_capacity: Array<Record<string, unknown>>;
+  transfers: Array<Record<string, unknown>>;
+  overlap_rules: Array<Record<string, unknown>>;
+  calibrations: Array<Record<string, unknown>>;
+}
